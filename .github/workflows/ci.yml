@@ -1,0 +1,60 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  release-test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: g++
+          - os: windows-latest
+            compiler: cl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+      - name: Configure
+        env:
+          CXX: ${{ matrix.compiler }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTREAMFORGE_BUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  linux-sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+      - name: Configure with Clang sanitizers
+        env:
+          CXX: clang++
+        run: cmake -S . -B build-sanitized -DCMAKE_BUILD_TYPE=Debug -DSTREAMFORGE_BUILD_TESTING=ON -DSTREAMFORGE_ENABLE_SANITIZERS=ON
+      - name: Build
+        run: cmake --build build-sanitized --parallel
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build-sanitized --output-on-failure
+
+  linux-tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+      - name: Configure with Clang ThreadSanitizer
+        env:
+          CXX: clang++
+        run: cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DSTREAMFORGE_BUILD_TESTING=ON -DSTREAMFORGE_ENABLE_TSAN=ON
+      - name: Build
+        run: cmake --build build-tsan --parallel
+      - name: Test concurrent-client coverage
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build-tsan --output-on-failure -R "TcpServerTest.ConcurrentClients"
+      - name: Test complete suite
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build-tsan --output-on-failure

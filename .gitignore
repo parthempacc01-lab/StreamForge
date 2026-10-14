@@ -1,0 +1,58 @@
+# Build directories
+build/
+build-msvc/
+build-release/
+build-asan/
+build-tsan/
+build-sanitized/
+
+# Benchmark output data directories
+benchmark-data/
+benchmark-data-release/
+tcp-benchmark-data/
+tcp-benchmark-data-release/
+bench-matrix-*/
+
+# Broker data directories (runtime storage)
+data/
+outputs/
+work/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!CMakePresets.json
+
+# Compiled artifacts
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# IDE files
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp segment log test artifacts
+/tmp/

@@ -1,0 +1,22 @@
+# Auto-detect text and normalize to LF in the repo
+* text=auto eol=lf
+
+# Force LF for these types
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.h text eol=lf
+*.c text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.cmake text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+
+# Keep binary files binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.obj binary
+*.pdb binary
