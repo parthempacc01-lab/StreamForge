@@ -29,7 +29,8 @@ class TcpServer {
     std::size_t maximum_active_connections{64};
   };
 
-  explicit TcpServer(broker::BrokerService& broker, Configuration configuration = {});
+  explicit TcpServer(broker::BrokerService& broker);
+  TcpServer(broker::BrokerService& broker, Configuration configuration);
   ~TcpServer();
 
   TcpServer(const TcpServer&) = delete;

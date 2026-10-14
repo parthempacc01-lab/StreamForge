@@ -68,7 +68,7 @@ storage::AppendResult BrokerService::produce(const std::string& topic, std::uint
       profiling_enabled_ ? &timing : nullptr);
   // Enforce size-based retention on every produce so the log does not grow
   // unboundedly when a retention_bytes limit is configured.
-  state->log->enforce_retention();
+  (void)state->log->enforce_retention();
   if (profiling_enabled_) {
     profile_operations_.fetch_add(1, std::memory_order_relaxed);
     profile_partition_wait_ns_.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(hold_started - wait_started).count()), std::memory_order_relaxed);

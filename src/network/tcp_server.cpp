@@ -64,8 +64,9 @@ bool send_all(NativeSocket socket, const std::vector<std::byte>& bytes) noexcept
 }
 
 std::uint16_t read_u16(const std::vector<std::byte>& input, std::size_t offset) {
-  return (static_cast<std::uint16_t>(input[offset]) << 8U) |
-         static_cast<std::uint16_t>(input[offset + 1]);
+  return static_cast<std::uint16_t>(
+      (static_cast<std::uint32_t>(input[offset]) << 8U) |
+      static_cast<std::uint32_t>(input[offset + 1]));
 }
 
 std::uint32_t read_u32(const std::vector<std::byte>& input, std::size_t offset) {
@@ -91,6 +92,9 @@ void append_u64(std::vector<std::byte>& output, std::uint64_t value) {
 }
 
 }  // namespace
+
+TcpServer::TcpServer(broker::BrokerService& broker)
+    : TcpServer(broker, Configuration{}) {}
 
 TcpServer::TcpServer(broker::BrokerService& broker, Configuration configuration)
     : broker_(broker), configuration_(configuration) {
@@ -364,7 +368,8 @@ protocol::Frame TcpServer::dispatch(const protocol::Frame& request) {
           const auto key_size = read_u32(request.payload, cursor); cursor += 4;
           const auto value_size = read_u32(request.payload, cursor); cursor += 4;
           if (key_size > request.payload.size() - cursor || value_size > request.payload.size() - cursor - key_size) throw std::invalid_argument("invalid produce record lengths");
-          storage::Record record{.timestamp_unix_ms = timestamp};
+          storage::Record record{};
+          record.timestamp_unix_ms = timestamp;
           record.key.assign(request.payload.begin() + static_cast<std::ptrdiff_t>(cursor), request.payload.begin() + static_cast<std::ptrdiff_t>(cursor + key_size)); cursor += key_size;
           record.value.assign(request.payload.begin() + static_cast<std::ptrdiff_t>(cursor), request.payload.begin() + static_cast<std::ptrdiff_t>(cursor + value_size)); cursor += value_size;
           records.push_back(std::move(record));

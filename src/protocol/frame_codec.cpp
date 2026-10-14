@@ -26,8 +26,9 @@ void append_u64(std::vector<std::byte>& output, std::uint64_t value) {
 }
 
 std::uint16_t read_u16(std::span<const std::byte> input, std::size_t offset) {
-  return (static_cast<std::uint16_t>(input[offset]) << 8U) |
-         static_cast<std::uint16_t>(input[offset + 1]);
+  return static_cast<std::uint16_t>(
+      (static_cast<std::uint32_t>(input[offset]) << 8U) |
+      static_cast<std::uint32_t>(input[offset + 1]));
 }
 
 std::uint32_t read_u32(std::span<const std::byte> input, std::size_t offset) {

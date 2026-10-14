@@ -12,7 +12,8 @@ constexpr const char* kCatalogMagic = "STREAMFORGE_TOPICS_V1";
 
 bool valid_topic_name(const std::string& name) {
   if (name.empty() || name.size() > 249 || name == "." || name == "..") return false;
-  for (const unsigned char character : name) {
+  for (const char ch : name) {
+    const auto character = static_cast<unsigned char>(ch);
     if (!(std::isalnum(character) || character == '.' || character == '_' || character == '-')) {
       return false;
     }

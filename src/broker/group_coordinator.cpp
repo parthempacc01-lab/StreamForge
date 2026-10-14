@@ -1,4 +1,5 @@
 #include "streamforge/broker/group_coordinator.hpp"
+#include <iterator>
 #include <stdexcept>
 namespace streamforge::broker {
 GroupAssignment GroupCoordinator::assignment(const Group& group, const std::string& member) const {
