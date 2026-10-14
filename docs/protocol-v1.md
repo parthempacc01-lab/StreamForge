@@ -1,9 +1,10 @@
 # StreamForge protocol v1
 
 This is StreamForge's custom protocol. It is not compatible with Kafka.
-The framing layer and a small TCP server are implemented. The server currently
-supports `PING` and `CREATE_TOPIC`; the remaining operation codes are reserved
-for later milestones.
+All six wire operations are implemented end-to-end: `PING`, `CREATE_TOPIC`,
+`PRODUCE_BATCH`, `FETCH`, `COMMIT_OFFSETS`, and `GET_METRICS`. The remaining
+reserved codes (`DESCRIBE_TOPIC`, `JOIN_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`)
+return a stable `UnknownOperation` response.
 
 ## Frame layout
 
