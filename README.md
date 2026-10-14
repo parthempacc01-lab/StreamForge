@@ -1,6 +1,6 @@
 # StreamForge (EventStream)
 
-[![CI](https://github.com/parth/StreamForge/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+[![CI](https://github.com/parthempacc01-lab/StreamForge/actions/workflows/ci.yml/badge.svg)](https://github.com/parthempacc01-lab/StreamForge/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![CMake](https://img.shields.io/badge/CMake-3.25%2B-064F8C.svg)](https://cmake.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -14,7 +14,7 @@ A high-performance, append-only partitioned commit log and message broker built 
 - **Custom Binary Framing Protocol**: Zero-overhead binary frames with 32-bit CRC verification, 64-bit request IDs, and streaming bounded incremental decoding.
 - **Persistent Log Storage Engine (`SegmentLog`)**:
   - Segment rolling driven by configurable byte thresholds (`maximum_segment_bytes`).
-  - Companion binary offset index files (`.index`) enabling $O(\log N)$ seeks via `std::lower_bound`.
+  - Companion binary offset index files (`.index`) with binary-search-based lookup (`std::lower_bound`) to skip ahead before scanning a segment slice.
   - Size-based retention policy (`retention_bytes`) with automatic tail and base-offset pruning.
   - Tail-repair crash recovery that auto-truncates unaligned/torn writes while rejecting corrupted records.
 - **Concurrency & Multithreading**:
@@ -112,7 +112,7 @@ Request and response formats are documented in `docs/protocol-v1.md`.
 ## Persistence, indexing, and retention
 
 Records are append-only and checksummed:
-- **Segment Rolling & Dense Indexing**: Segments roll automatically when reaching configured byte thresholds. Each `.log` segment file has a companion `.index` file with binary offset-to-physical-position mappings for binary-search seeks during `FETCH` (reducing read scan offsets).
+- **Segment Rolling & Dense Indexing**: Segments roll automatically when reaching configured byte thresholds. Each `.log` segment file has a companion `.index` file recording every record's physical position. During `FETCH`, a `std::lower_bound` lookup on the index narrows the starting scan position before the segment bytes are read into memory and scanned forward.
 - **Retention**: Size-based retention policies (`retention_bytes`) prune the oldest sealed segments when total log footprint exceeds limits.
 - **Delivery & Recovery**: On startup, incomplete final records are repaired; corrupted records cause startup failure. Topic metadata and committed consumer offsets are persisted atomically through temporary-file replacement. Committed offsets support **at-least-once** consumption when consumers commit strictly after processing. `std::ofstream::flush()` commits writes to OS buffers, but POSIX `fsync` (`AcknowledgementMode::kSynced`) is required for true hardware power-loss durability.
 
