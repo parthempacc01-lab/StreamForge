@@ -190,7 +190,76 @@ TEST_F(SegmentLogTest, RebuildsIndexAutomaticallyIfDeletedOrCorrupted) {
   EXPECT_TRUE(index_recreated);
 }
 
+// Regression: after retention prunes the oldest segments and advances
+// base_offset_, recover() in a new SegmentLog instance (simulating a process
+// restart) must accept the non-zero first-segment base offset rather than
+// throwing "first segment has an unexpected base offset".
+TEST_F(SegmentLogTest, RetentionSurvivesRestart) {
+  SegmentLogOptions options;
+  options.maximum_segment_bytes = 64;
+  options.retention_bytes = 150;
+
+  // Phase 1: write enough data to create multiple segments, then prune.
+  {
+    SegmentLog log(directory_, 0, options);
+    log.recover();
+    for (int i = 0; i < 8; ++i) {
+      log.append({Record{.value = {std::byte(static_cast<unsigned char>(i))}}},
+                 AcknowledgementMode::kAppended);
+    }
+    const auto stats = log.enforce_retention();
+    ASSERT_GT(stats.segments_deleted, 0U) << "precondition: retention must have deleted segments";
+    ASSERT_GT(log.base_offset(), 0U) << "precondition: base_offset must have advanced";
+  }
+
+  // Phase 2: recover in a brand-new instance — this is the restart.
+  SegmentLog restarted(directory_, 0, options);
+  ASSERT_NO_THROW(restarted.recover())
+      << "recover() must not throw after retention pruned the leading segments";
+
+  // Offsets before the new base are gone.
+  EXPECT_THROW(restarted.fetch(0, 1), std::out_of_range);
+  // Offsets within the retained window are readable.
+  EXPECT_NO_THROW(restarted.fetch(restarted.base_offset(), 1));
+
+  // Appending after restart and recovering a third time must also succeed.
+  restarted.append({Record{.value = {std::byte{0xAB}}}},
+                   AcknowledgementMode::kAppended);
+  const std::uint64_t after_next = restarted.next_offset();
+
+  SegmentLog third(directory_, 0, options);
+  ASSERT_NO_THROW(third.recover());
+  EXPECT_EQ(third.next_offset(), after_next);
+}
+
+// Regression: BrokerService::produce() must enforce retention automatically
+// so the log does not grow unboundedly when retention_bytes is configured.
+// This test exercises SegmentLog directly since BrokerService does not expose
+// options; it documents that enforce_retention() is idempotent and safe to
+// call on every produce.
+TEST_F(SegmentLogTest, RetentionEnforcedAutomaticallyDoesNotAccumulateSegments) {
+  SegmentLogOptions options;
+  options.maximum_segment_bytes = 64;
+  options.retention_bytes = 150;
+
+  SegmentLog log(directory_, 0, options);
+  log.recover();
+
+  // Write well beyond the retention limit and call enforce_retention() after
+  // each append (mirroring what BrokerService::produce() now does).
+  for (int i = 0; i < 20; ++i) {
+    log.append({Record{.value = {std::byte(static_cast<unsigned char>(i))}}},
+               AcknowledgementMode::kAppended);
+    log.enforce_retention();
+  }
+
+  // Total bytes must be at or below the configured retention limit.
+  EXPECT_LE(log.total_bytes(), options.retention_bytes);
+  // At least one segment must remain (never delete the active segment).
+  EXPECT_GE(log.segment_count(), 1U);
+  // The base offset must have advanced beyond zero.
+  EXPECT_GT(log.base_offset(), 0U);
+}
+
 }  // namespace
 }  // namespace streamforge::storage
-
-

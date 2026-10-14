@@ -142,7 +142,12 @@ void SegmentLog::recover() {
     segments_.push_back(Segment{base_offset_, base_offset_, path, index_path_for(path), 0, {}});
   }
   std::sort(segments_.begin(), segments_.end(), [](const Segment& left, const Segment& right) { return left.base_offset < right.base_offset; });
-  if (segments_.front().base_offset != base_offset_) throw std::runtime_error("first segment has an unexpected base offset");
+  // Derive the effective base offset from what is actually on disk. The
+  // constructor-supplied base_offset_ is only used when no segments exist yet
+  // (the empty-directory branch above). After retention prunes the oldest
+  // segment(s), the first surviving segment will have a non-zero base offset
+  // that must be accepted here rather than rejected.
+  base_offset_ = segments_.front().base_offset;
   std::uint64_t expected = base_offset_;
   for (std::size_t index = 0; index < segments_.size(); ++index) {
     auto& segment = segments_[index];
