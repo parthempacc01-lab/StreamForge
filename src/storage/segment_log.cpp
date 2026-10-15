@@ -170,9 +170,13 @@ void SegmentLog::recover() {
     build_or_load_index(segment);
   }
   next_offset_ = expected;
+  needs_recovery_ = false;
 }
 
 AppendResult SegmentLog::append(std::vector<Record> records, AcknowledgementMode mode, AppendTiming* timing) {
+  if (needs_recovery_) {
+    throw std::runtime_error("partition log requires recovery after append failure");
+  }
   const auto append_started = std::chrono::steady_clock::now();
   if (records.empty()) {
     throw std::invalid_argument("cannot append an empty record batch");
@@ -187,55 +191,90 @@ AppendResult SegmentLog::append(std::vector<Record> records, AcknowledgementMode
   }
   std::size_t encoded_batch_bytes = 0;
   for (const auto& bytes : encoded_records) encoded_batch_bytes += bytes.size();
+
+  const auto initial_segment_count = segments_.size();
+  const auto initial_active_bytes = segments_.back().bytes;
+  const auto initial_active_index_size = segments_.back().index.size();
+
   roll_if_needed(encoded_batch_bytes);
 
-  auto& active = segments_.back();
-  std::ofstream output(active.path, std::ios::binary | std::ios::app);
-  if (!output) {
-    throw std::runtime_error("cannot open segment for append: " + active.path.string());
-  }
-
-  std::ofstream index_output(active.index_path, std::ios::binary | std::ios::app);
-  std::uint64_t curr_pos = active.bytes;
-
-  for (std::size_t i = 0; i < encoded_records.size(); ++i) {
-    const auto& bytes = encoded_records[i];
-    output.write(reinterpret_cast<const char*>(bytes.data()),
-                 static_cast<std::streamsize>(bytes.size()));
+  try {
+    auto& active = segments_.back();
+    std::ofstream output(active.path, std::ios::binary | std::ios::app);
     if (!output) {
-      throw std::runtime_error("failed appending record to segment: " + active.path.string());
+      throw std::runtime_error("cannot open segment for append: " + active.path.string());
     }
 
-    const std::uint64_t rec_offset = first_offset + i;
-    active.index.push_back(IndexEntry{rec_offset, curr_pos});
-    if (index_output) {
-      index_output.write(reinterpret_cast<const char*>(&rec_offset), sizeof(rec_offset));
-      index_output.write(reinterpret_cast<const char*>(&curr_pos), sizeof(curr_pos));
-    }
-    curr_pos += bytes.size();
-  }
+    std::ofstream index_output(active.index_path, std::ios::binary | std::ios::app);
+    std::uint64_t curr_pos = active.bytes;
 
-  const auto flush_started = std::chrono::steady_clock::now();
-  output.flush();
-  if (index_output) index_output.flush();
-  if (!output) {
-    throw std::runtime_error("failed flushing segment stream: " + active.path.string());
+    for (std::size_t i = 0; i < encoded_records.size(); ++i) {
+      if (options_.inject_write_failure_after_records > 0 &&
+          i + 1 == options_.inject_write_failure_after_records) {
+        const auto& bytes = encoded_records[i];
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        output.flush();
+        throw std::runtime_error("simulated write failure after " +
+                                 std::to_string(i + 1) + " records");
+      }
+
+      const auto& bytes = encoded_records[i];
+      output.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+      if (!output) {
+        throw std::runtime_error("failed appending record to segment: " + active.path.string());
+      }
+
+      const std::uint64_t rec_offset = first_offset + i;
+      active.index.push_back(IndexEntry{rec_offset, curr_pos});
+      if (index_output) {
+        index_output.write(reinterpret_cast<const char*>(&rec_offset), sizeof(rec_offset));
+        index_output.write(reinterpret_cast<const char*>(&curr_pos), sizeof(curr_pos));
+      }
+      curr_pos += bytes.size();
+    }
+
+    const auto flush_started = std::chrono::steady_clock::now();
+    output.flush();
+    if (index_output) index_output.flush();
+    if (!output) {
+      throw std::runtime_error("failed flushing segment stream: " + active.path.string());
+    }
+    if (mode == AcknowledgementMode::kSynced) {
+      synchronize();
+    }
+    next_offset_ = candidate_offset;
+    active.next_offset = candidate_offset;
+    active.bytes += encoded_batch_bytes;
+    if (timing != nullptr) {
+      timing->append_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - append_started).count());
+      timing->flush_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - flush_started).count());
+    }
+    return AppendResult{first_offset, candidate_offset - 1};
+  } catch (...) {
+    needs_recovery_ = true;
+    if (segments_.size() > initial_segment_count) {
+      const auto extra = segments_.back();
+      segments_.pop_back();
+      std::error_code ec;
+      std::filesystem::remove(extra.path, ec);
+      std::filesystem::remove(extra.index_path, ec);
+    }
+    auto& active = segments_.back();
+    active.index.resize(initial_active_index_size);
+    std::error_code ec;
+    std::filesystem::resize_file(active.path, initial_active_bytes, ec);
+    std::filesystem::resize_file(active.index_path, initial_active_index_size * sizeof(IndexEntry), ec);
+    throw;
   }
-  if (mode == AcknowledgementMode::kSynced) {
-    synchronize();
-  }
-  next_offset_ = candidate_offset;
-  active.next_offset = candidate_offset;
-  active.bytes += encoded_batch_bytes;
-  if (timing != nullptr) {
-    timing->append_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - append_started).count());
-    timing->flush_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - flush_started).count());
-  }
-  return AppendResult{first_offset, candidate_offset - 1};
 }
 
 std::vector<Record> SegmentLog::fetch(std::uint64_t start_offset,
                                       std::size_t maximum_records) const {
+  if (needs_recovery_) {
+    throw std::runtime_error("partition log requires recovery after append failure");
+  }
   if (start_offset < base_offset_ || start_offset > next_offset_) {
     throw std::out_of_range("requested offset is outside the retained range");
   }
@@ -249,6 +288,9 @@ std::vector<Record> SegmentLog::fetch(std::uint64_t start_offset,
 }
 
 RetentionStats SegmentLog::enforce_retention() {
+  if (needs_recovery_) {
+    throw std::runtime_error("partition log requires recovery after append failure");
+  }
   RetentionStats stats{};
   if (options_.retention_bytes == 0 || segments_.size() <= 1) {
     return stats;
@@ -281,6 +323,12 @@ std::size_t SegmentLog::total_bytes() const noexcept {
   std::size_t sum = 0;
   for (const auto& segment : segments_) sum += segment.bytes;
   return sum;
+}
+
+bool SegmentLog::needs_recovery() const noexcept { return needs_recovery_; }
+
+void SegmentLog::set_fault_injection_after_records(std::size_t count) noexcept {
+  options_.inject_write_failure_after_records = count;
 }
 
 void SegmentLog::synchronize() const {

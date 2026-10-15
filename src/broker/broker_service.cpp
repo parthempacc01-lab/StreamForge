@@ -119,12 +119,23 @@ std::shared_ptr<BrokerService::PartitionState> BrokerService::create_partition_l
   if (const auto found = logs_.find(key); found != logs_.end()) return found->second;
   const auto directory = data_root_ / "topics" / topic /
                          ("partition-" + std::to_string(partition_id));
-  auto log = std::make_unique<storage::SegmentLog>(directory, 0);
+  auto log = std::make_unique<storage::SegmentLog>(directory, 0, limits_.storage_options);
   log->recover();
   auto state = std::make_shared<PartitionState>(std::move(log));
   auto [inserted, unused] = logs_.emplace(key, std::move(state));
   (void)unused;
   return inserted->second;
+}
+
+void BrokerService::recover_partition(const std::string& topic, std::uint32_t partition_id) {
+  std::shared_lock lifecycle_lock(lifecycle_mutex_);
+  const auto state = partition(topic, partition_id);
+  std::unique_lock partition_lock(state->mutex);
+  state->log->recover();
+}
+
+const BrokerLimits& BrokerService::limits() const noexcept {
+  return limits_;
 }
 
 }  // namespace streamforge::broker

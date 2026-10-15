@@ -25,6 +25,9 @@ struct SegmentLogOptions {
   // Maximum total retained bytes across all closed and active segments.
   // 0 means retention by size is disabled.
   std::size_t retention_bytes{0};
+  // Fault-injection testing hook: if non-zero, simulates a write failure
+  // after writing N records in an append batch (0 disables fault injection).
+  std::size_t inject_write_failure_after_records{0};
 };
 
 struct RetentionStats {
@@ -57,6 +60,8 @@ class SegmentLog {
   [[nodiscard]] const std::filesystem::path& path() const noexcept;
   [[nodiscard]] std::size_t segment_count() const noexcept;
   [[nodiscard]] std::size_t total_bytes() const noexcept;
+  [[nodiscard]] bool needs_recovery() const noexcept;
+  void set_fault_injection_after_records(std::size_t count) noexcept;
 
  private:
   void synchronize() const;
@@ -79,6 +84,7 @@ class SegmentLog {
   std::uint64_t next_offset_;
   SegmentLogOptions options_;
   std::vector<Segment> segments_;
+  bool needs_recovery_{false};
 };
 
 }  // namespace streamforge::storage

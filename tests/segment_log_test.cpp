@@ -261,5 +261,44 @@ TEST_F(SegmentLogTest, RetentionEnforcedAutomaticallyDoesNotAccumulateSegments) 
   EXPECT_GT(log.base_offset(), 0U);
 }
 
+TEST_F(SegmentLogTest, PartialWriteRollsBackAndMarksRecoveryRequired) {
+  SegmentLogOptions options;
+  // Inject failure after 2 records in a 3-record batch
+  options.inject_write_failure_after_records = 2;
+
+  SegmentLog log(directory_, 0, options);
+  log.recover();
+
+  std::vector<Record> records;
+  records.push_back(Record{.value = {std::byte{1}}});
+  records.push_back(Record{.value = {std::byte{2}}});
+  records.push_back(Record{.value = {std::byte{3}}});
+
+  // The append must fail due to the injected fault
+  EXPECT_THROW(log.append(records, AcknowledgementMode::kAppended), std::runtime_error);
+
+  // The log must now be marked as requiring recovery
+  EXPECT_TRUE(log.needs_recovery());
+
+  // Subsequent append and fetch calls must be safely rejected to prevent offset reuse or inconsistent state
+  EXPECT_THROW(log.append({Record{.value = {std::byte{99}}}}, AcknowledgementMode::kAppended), std::runtime_error);
+  EXPECT_THROW(log.fetch(0, 1), std::runtime_error);
+
+  // Clearing the fault injection and recovering must restore consistent state
+  log.set_fault_injection_after_records(0);
+  ASSERT_NO_THROW(log.recover());
+  EXPECT_FALSE(log.needs_recovery());
+
+  // New appends succeed, starting contiguously from offset 0
+  auto res = log.append({Record{.value = {std::byte{10}}}}, AcknowledgementMode::kAppended);
+  EXPECT_EQ(res.first_offset, 0U);
+  EXPECT_EQ(res.last_offset, 0U);
+
+  auto fetched = log.fetch(0, 1);
+  ASSERT_EQ(fetched.size(), 1U);
+  EXPECT_EQ(fetched[0].offset, 0U);
+  EXPECT_EQ(fetched[0].value[0], std::byte{10});
+}
+
 }  // namespace
 }  // namespace streamforge::storage

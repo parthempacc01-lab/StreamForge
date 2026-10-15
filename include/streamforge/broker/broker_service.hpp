@@ -22,7 +22,12 @@ struct FetchedRecords {
   std::vector<storage::Record> records;
   std::uint64_t next_offset;
 };
-struct BrokerLimits { std::uint32_t maximum_partitions_per_topic{1024}; std::size_t maximum_records_per_batch{10000}; std::size_t maximum_fetch_records{1000}; };
+struct BrokerLimits {
+  std::uint32_t maximum_partitions_per_topic{1024};
+  std::size_t maximum_records_per_batch{10000};
+  std::size_t maximum_fetch_records{1000};
+  storage::SegmentLogOptions storage_options{};
+};
 struct BrokerProfile { std::uint64_t operations{0}; std::uint64_t partition_wait_ns{0}; std::uint64_t partition_hold_ns{0}; std::uint64_t append_ns{0}; std::uint64_t flush_ns{0}; };
 
 // Single-process service façade. Public operations take a shared lifecycle lock;
@@ -36,6 +41,7 @@ class BrokerService {
   explicit BrokerService(std::filesystem::path data_root, BrokerLimits limits = {});
 
   void recover();
+  void recover_partition(const std::string& topic, std::uint32_t partition);
   void create_topic(const std::string& name, std::uint32_t partition_count);
   [[nodiscard]] storage::AppendResult produce(
       const std::string& topic, std::uint32_t partition,
@@ -50,6 +56,7 @@ class BrokerService {
                                                                std::uint32_t partition) const;
   void set_profiling_enabled(bool enabled) noexcept;
   [[nodiscard]] BrokerProfile profile() const noexcept;
+  [[nodiscard]] const BrokerLimits& limits() const noexcept;
 
  private:
   struct PartitionState {

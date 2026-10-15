@@ -219,5 +219,88 @@ TEST_F(BrokerServiceTest, RejectsRecoveryAfterServiceOperationsBegin) {
   EXPECT_THROW(broker.recover(), std::logic_error);
 }
 
+TEST_F(BrokerServiceTest, ConfiguredRetentionEnforcesAndSurvivesRestart) {
+  BrokerLimits limits;
+  limits.storage_options.maximum_segment_bytes = 80;
+  limits.storage_options.retention_bytes = 200;
+
+  BrokerService broker(root_, limits);
+  broker.recover();
+  broker.create_topic("sensor-stream", 1);
+
+  // Each record with header+checksum is ~35-40 bytes. Writing 15 batches rolls multiple segments
+  // and triggers size-based retention automatically on BrokerService::produce().
+  for (int i = 0; i < 15; ++i) {
+    std::vector<storage::Record> batch;
+    batch.push_back(storage::Record{.key = {std::byte{1}}, .value = {std::byte(static_cast<unsigned char>(i))}});
+    (void)broker.produce("sensor-stream", 0, std::move(batch), storage::AcknowledgementMode::kAppended);
+  }
+
+  // The oldest records (offset 0) must have been pruned by retention
+  EXPECT_THROW(broker.fetch("sensor-stream", 0, 0, 1), std::out_of_range);
+
+  // But we can successfully fetch from the latest offsets
+  const auto latest_fetch = broker.fetch("sensor-stream", 0, 14, 1);
+  ASSERT_EQ(latest_fetch.records.size(), 1U);
+  EXPECT_EQ(latest_fetch.records[0].offset, 14U);
+
+  // Restart the broker with the same retention configuration and verify recovery
+  BrokerService restarted(root_, limits);
+  ASSERT_NO_THROW(restarted.recover());
+
+  // Pruned offsets are still out of range
+  EXPECT_THROW(restarted.fetch("sensor-stream", 0, 0, 1), std::out_of_range);
+
+  // Retained offset 14 is still cleanly readable
+  const auto recovered_fetch = restarted.fetch("sensor-stream", 0, 14, 1);
+  ASSERT_EQ(recovered_fetch.records.size(), 1U);
+  EXPECT_EQ(recovered_fetch.records[0].offset, 14U);
+
+  // New appends after restart continue with contiguous offsets
+  std::vector<storage::Record> new_batch;
+  new_batch.push_back(storage::Record{.value = {std::byte{0xFF}}});
+  const auto append_res = restarted.produce("sensor-stream", 0, std::move(new_batch), storage::AcknowledgementMode::kAppended);
+  EXPECT_EQ(append_res.first_offset, 15U);
+}
+
+TEST_F(BrokerServiceTest, AppendFailurePreventsInconsistentWritesUntilRecovered) {
+  BrokerLimits limits;
+  // Deterministically inject fault after record 2 in an append batch
+  limits.storage_options.inject_write_failure_after_records = 2;
+
+  BrokerService broker(root_, limits);
+  broker.recover();
+  broker.create_topic("transactions", 1);
+
+  std::vector<storage::Record> batch;
+  batch.push_back(storage::Record{.value = {std::byte{1}}});
+  batch.push_back(storage::Record{.value = {std::byte{2}}});
+  batch.push_back(storage::Record{.value = {std::byte{3}}});
+
+  // Produce must fail because of the injected fault
+  EXPECT_THROW(broker.produce("transactions", 0, std::move(batch), storage::AcknowledgementMode::kAppended), std::runtime_error);
+
+  // Any subsequent produce or fetch on that partition must be rejected while in failed state
+  std::vector<storage::Record> retry_batch;
+  retry_batch.push_back(storage::Record{.value = {std::byte{100}}});
+  EXPECT_THROW(broker.produce("transactions", 0, std::move(retry_batch), storage::AcknowledgementMode::kAppended), std::runtime_error);
+  EXPECT_THROW(broker.fetch("transactions", 0, 0, 1), std::runtime_error);
+
+  // Partition recovery clears the failure state and restores consistency
+  ASSERT_NO_THROW(broker.recover_partition("transactions", 0));
+
+  // Now produce can proceed cleanly without offset reuse
+  std::vector<storage::Record> clean_batch;
+  clean_batch.push_back(storage::Record{.value = {std::byte{42}}});
+  const auto result = broker.produce("transactions", 0, std::move(clean_batch), storage::AcknowledgementMode::kAppended);
+  EXPECT_EQ(result.first_offset, 0U);
+  EXPECT_EQ(result.last_offset, 0U);
+
+  const auto fetched = broker.fetch("transactions", 0, 0, 1);
+  ASSERT_EQ(fetched.records.size(), 1U);
+  EXPECT_EQ(fetched.records[0].offset, 0U);
+  EXPECT_EQ(fetched.records[0].value[0], std::byte{42});
+}
+
 }  // namespace
 }  // namespace streamforge::broker

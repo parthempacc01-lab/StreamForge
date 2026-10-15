@@ -11,10 +11,10 @@ A high-performance, append-only partitioned commit log and message broker built 
 
 ## Key Features
 
-- **Custom Binary Framing Protocol**: Zero-overhead binary frames with 32-bit CRC verification, 64-bit request IDs, and streaming bounded incremental decoding.
+- **Custom Binary Framing Protocol**: Custom binary framing with 32-bit CRC verification, 64-bit request IDs, and streaming bounded incremental decoding.
 - **Persistent Log Storage Engine (`SegmentLog`)**:
   - Segment rolling driven by configurable byte thresholds (`maximum_segment_bytes`).
-  - Companion binary offset index files (`.index`) with binary-search-based lookup (`std::lower_bound`) to skip ahead before scanning a segment slice.
+  - Companion binary offset index files (`.index`) with binary-search-based lookup (`std::lower_bound`) to locate the physical position before reading and forward-scanning segment bytes in memory.
   - Size-based retention policy (`retention_bytes`) with automatic tail and base-offset pruning.
   - Tail-repair crash recovery that auto-truncates unaligned/torn writes while rejecting corrupted records.
 - **Concurrency & Multithreading**:
@@ -57,7 +57,7 @@ client ── TCP Frames (Protocol V1) ──> TcpServer ──> BrokerService
 cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64
 cmake --build build-msvc --config Release
 
-# 2. Run Test Suite (All 47 Unit & Integration Tests)
+# 2. Run Test Suite (All 53 Unit & Integration Tests)
 ctest --test-dir build-msvc -C Release --output-on-failure
 
 # 3. Start Broker Daemon
@@ -112,7 +112,7 @@ Request and response formats are documented in `docs/protocol-v1.md`.
 ## Persistence, indexing, and retention
 
 Records are append-only and checksummed:
-- **Segment Rolling & Dense Indexing**: Segments roll automatically when reaching configured byte thresholds. Each `.log` segment file has a companion `.index` file recording every record's physical position. During `FETCH`, a `std::lower_bound` lookup on the index narrows the starting scan position before the segment bytes are read into memory and scanned forward.
+- **Segment Rolling & Dense Indexing**: Segments roll automatically when reaching configured byte thresholds. Each `.log` segment file has a companion `.index` file recording every record's physical position. During `FETCH`, a `std::lower_bound` binary search on the index locates the starting physical file position before the segment bytes are read into memory and scanned forward.
 - **Retention**: Size-based retention policies (`retention_bytes`) prune the oldest sealed segments when total log footprint exceeds limits.
 - **Delivery & Recovery**: On startup, incomplete final records are repaired; corrupted records cause startup failure. Topic metadata and committed consumer offsets are persisted atomically through temporary-file replacement. Committed offsets support **at-least-once** consumption when consumers commit strictly after processing. `std::ofstream::flush()` commits writes to OS buffers, but POSIX `fsync` (`AcknowledgementMode::kSynced`) is required for true hardware power-loss durability.
 
