@@ -40,7 +40,7 @@ StreamForge is an append-only, partitioned commit log and message broker impleme
 │                                                                                        │
 │  - Active Segment: Append-only write stream with contiguous physical offset tracking   │
 │  - Segment Rolling: Bounded segment size rolling (`maximum_segment_bytes`)             │
-│  - Index Seeking: Binary search (`std::lower_bound`) on `.index` for O(log N) fetch    │
+│  - Index Seeking: Binary search (`std::lower_bound`) on `.index` for physical position lookup │
 │  - Retention: Size-based cleanup (`retention_bytes`) prunes oldest sealed segments     │
 │  - Tail Repair: Auto-truncates incomplete torn frames on crash restart                 │
 └────────────────────────────────────────────────────────────────────────────────────────┘
