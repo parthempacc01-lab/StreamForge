@@ -232,11 +232,9 @@ TEST_F(SegmentLogTest, RetentionSurvivesRestart) {
   EXPECT_EQ(third.next_offset(), after_next);
 }
 
-// Regression: BrokerService::produce() must enforce retention automatically
-// so the log does not grow unboundedly when retention_bytes is configured.
-// This test exercises SegmentLog directly since BrokerService does not expose
-// options; it documents that enforce_retention() is idempotent and safe to
-// call on every produce.
+// Regression: enforce_retention() is idempotent and safe to call after appends.
+// The end-to-end integration test through BrokerService::produce() and broker restart
+// is tested in BrokerServiceTest.ConfiguredRetentionEnforcesAndSurvivesRestart.
 TEST_F(SegmentLogTest, RetentionEnforcedAutomaticallyDoesNotAccumulateSegments) {
   SegmentLogOptions options;
   options.maximum_segment_bytes = 64;
