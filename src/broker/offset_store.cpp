@@ -1,4 +1,5 @@
 #include "streamforge/broker/offset_store.hpp"
+#include "streamforge/storage/durability.hpp"
 
 #include <fstream>
 #include <stdexcept>
@@ -40,11 +41,19 @@ std::optional<std::uint64_t> OffsetStore::get(const std::string& group, const st
 }
 
 void OffsetStore::persist() const {
-  std::filesystem::create_directories(path().parent_path()); const auto temporary = path().string() + ".tmp";
-  { std::ofstream output(temporary, std::ios::trunc); if (!output) throw std::runtime_error("cannot write offset store");
-    output << kMagic << '\n'; for (const auto& [key, offset] : offsets_) { const auto& [group, topic, partition] = key; output << group << ' ' << topic << ' ' << partition << ' ' << offset << '\n'; }
-    output.flush(); if (!output) throw std::runtime_error("cannot complete offset store"); }
-  std::error_code error; std::filesystem::rename(temporary, path(), error);
-  if (error) { std::filesystem::remove(temporary); throw std::runtime_error("cannot replace offset store: " + error.message()); }
+  std::filesystem::create_directories(path().parent_path());
+  const auto temporary = path().string() + ".tmp";
+  {
+    std::ofstream output(temporary, std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot write offset store");
+    output << kMagic << '\n';
+    for (const auto& [key, offset] : offsets_) {
+      const auto& [group, topic, partition] = key;
+      output << group << ' ' << topic << ' ' << partition << ' ' << offset << '\n';
+    }
+    output.flush();
+    if (!output) throw std::runtime_error("cannot complete offset store");
+  }
+  storage::atomic_durable_rename(temporary, path());
 }
 }  // namespace streamforge::broker

@@ -14,14 +14,14 @@ A high-performance, append-only partitioned commit log and message broker built 
 - **Custom Binary Framing Protocol**: Custom binary framing with 32-bit CRC verification, 64-bit request IDs, and streaming bounded incremental decoding.
 - **Persistent Log Storage Engine (`SegmentLog`)**:
   - Segment rolling driven by configurable byte thresholds (`maximum_segment_bytes`).
-  - Companion binary offset index files (`.index`) with binary-search-based lookup (`std::lower_bound`) to locate the physical position before reading and forward-scanning segment bytes in memory.
+  - Companion binary offset index files (`.index`) with binary-search-based lookup (`std::lower_bound`) to seek directly to the physical file position and read only the requested bounded byte slice, eliminating full segment reads into memory.
   - Size-based retention policy (`retention_bytes`) with automatic tail and base-offset pruning.
   - Tail-repair crash recovery that auto-truncates unaligned/torn writes while rejecting corrupted records.
 - **Concurrency & Multithreading**:
   - Fine-grained locking hierarchy: shared lifecycle and catalog locks with per-partition serialized mutexes for concurrent produce/fetch across topics.
 - **Consumer Group Coordination & At-Least-Once Delivery**:
-  - Durable committed offsets with atomic file replacement.
-  - In-memory group coordinator with automatic partition rebalancing.
+  - Durable committed offsets and topic metadata with atomic temporary-file replacement and explicit hardware synchronization (`fsync` of temp file and parent directory on POSIX; `FlushFileBuffers` on Windows).
+  - Experimental Group Coordinator: in-memory partition assignment/rebalancing prototype; group-management operations are not yet exposed through the TCP protocol.
 - **Production Observability**:
   - Native Prometheus exposition format (`GET_METRICS`) reporting live $p50$, $p95$, and $p99$ latency percentiles, record counts, byte throughput, and active connections.
 - **Sanitizer & CI Verified**:
@@ -57,7 +57,7 @@ client ── TCP Frames (Protocol V1) ──> TcpServer ──> BrokerService
 cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64
 cmake --build build-msvc --config Release
 
-# 2. Run Test Suite (All 53 Unit & Integration Tests)
+# 2. Run Test Suite (All 56 Unit & Integration Tests)
 ctest --test-dir build-msvc -C Release --output-on-failure
 
 # 3. Start Broker Daemon
@@ -112,37 +112,63 @@ Request and response formats are documented in `docs/protocol-v1.md`.
 ## Persistence, indexing, and retention
 
 Records are append-only and checksummed:
-- **Segment Rolling & Dense Indexing**: Segments roll automatically when reaching configured byte thresholds. Each `.log` segment file has a companion `.index` file recording every record's physical position. During `FETCH`, a `std::lower_bound` binary search on the index locates the starting physical file position before the segment bytes are read into memory and scanned forward.
+- **Segment Rolling & Dense Indexing**: Segments roll automatically when reaching configured byte thresholds. Each `.log` segment file has a companion `.index` file recording every record's physical position. During `FETCH`, a `std::lower_bound` binary search on the index locates the starting physical file position and bounded byte range before seeking directly and reading only the required record bytes into memory.
 - **Retention**: Size-based retention policies (`retention_bytes`) prune the oldest sealed segments when total log footprint exceeds limits.
-- **Delivery & Recovery**: On startup, incomplete final records are repaired; corrupted records cause startup failure. Topic metadata and committed consumer offsets are persisted atomically through temporary-file replacement. Committed offsets support **at-least-once** consumption when consumers commit strictly after processing. `std::ofstream::flush()` commits writes to OS buffers, but POSIX `fsync` (`AcknowledgementMode::kSynced`) is required for true hardware power-loss durability.
+- **Delivery & Recovery**: On startup, incomplete final records are repaired; corrupted records cause startup failure. Topic metadata and committed consumer offsets are persisted atomically through temporary-file replacement and explicit hardware persistence (write -> flush -> fsync temp -> rename -> fsync parent directory on POSIX, `FlushFileBuffers` on Windows). Committed offsets support **at-least-once** consumption when consumers commit strictly after processing. Synchronous segment durability (`AcknowledgementMode::kSynced`) flushes and synchronizes segment log files to non-volatile storage.
 
-## Benchmark
+## Benchmark Summary
 
-See the reproducible methodology and limits in [docs/benchmarking.md](docs/benchmarking.md).
+Performance is evaluated using dedicated, reproducible benchmark binaries with explicit workload parameters. Detailed methodology, hardware limits, lock contention diagnostics, and full client scaling matrices are documented in [docs/benchmarking.md](docs/benchmarking.md).
 
-Run local and TCP benchmarks across configurations:
+### Headline Workload: Concurrent TCP Produce (Release, 4 Partitions)
+
+This headline scenario measures end-to-end multi-client TCP produce throughput and request latency across independent partitions:
 
 ```powershell
-# Debug baseline:
-.\build-msvc\Debug\eventstream_tcp_benchmark.exe .\tcp-concurrent-data --messages 20000 --payload-bytes 256 --batch-size 16 --clients 4 --partitions 4
-
-# Release optimized:
-.\build-msvc\Release\eventstream_benchmark.exe .\benchmark-data-release --messages 50000 --payload-bytes 256 --batch-size 32
-.\build-msvc\Release\eventstream_tcp_benchmark.exe .\tcp-concurrent-data-release --messages 20000 --payload-bytes 256 --batch-size 16 --clients 4 --partitions 4
+.\build-release\Release\eventstream_tcp_benchmark.exe .\tcp-independent-4 `
+  --messages 1000 --payload-bytes 256 --batch-size 16 `
+  --clients 4 --partitions 4 --warmup-batches 2 --repetitions 5 --profile off
 ```
 
-### Empirical Benchmark Measurements (Windows x64, MSVC 19.44)
+- **Configuration**:
+  - **Payload Size**: 256 bytes per record
+  - **Batch Size**: 16 records per produce request
+  - **Client Count**: 4 concurrent clients (each client on a dedicated TCP socket)
+  - **Partition Count**: 4 independent partitions (deterministic assignment: client $i \to \text{partition } i \pmod 4$)
+  - **Persistence Mode**: `appended` (C++ stream flushed to OS page cache; synchronous hardware `fsync` is unavailable on Windows)
+  - **Repetitions & Volume**: 5 isolated runs × 1,000 messages = 5,000 total verified messages (2 warm-up batches discarded per run)
+  - **Measurement Method**: End-to-end client latency, timed from immediately before socket `send()` through complete wire response decoding and validation. Excludes broker startup, topic creation, connection handshake, and warm-up. Throughput is the median across 5 runs; percentiles pool all measured batch samples using index $\lfloor p \cdot (N - 1) \rfloor$. Stored messages and offsets are verified via broker fetch after each run.
 
-Empirical performance measured across 5 consecutive runs per benchmark on identical hardware:
+- **Headline Results (Windows x64, MSVC 19.44, Release)**:
+  - **Median Throughput**: **48,007 msgs/s** (11.72 MiB/s) — run range: 40,912 to 54,219 msgs/s
+  - **Latency Percentiles**: **p50 = 1.08 ms**, **p95 = 2.19 ms**, **p99 = 2.74 ms**
+  - **Reliability**: 0 failed requests; 100% stored record and offset count integrity confirmed across partitions.
 
-| Build Mode | Scenario | Concurrency | Batch Size | Messages / Run | Throughput (msgs/sec) | Throughput (MiB/s) | p50 Latency | p95 Latency | p99 Latency |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Debug** | Local Append | 1 client | 32 records | 50,000 | 14,741 msgs/s | 3.59 MiB/s | 1.91 ms | 3.26 ms | 4.04 ms |
-| **Debug** | Concurrent TCP Produce | 4 clients, 4 partitions | 16 records | 20,000 | 14,267 msgs/s | 3.48 MiB/s | 3.98 ms | 6.65 ms | 10.71 ms |
-| **Release** | **Local Append** | 1 client | 32 records | 50,000 | **29,990 msgs/s** | **7.32 MiB/s** | **0.95 ms** | **1.65 ms** | **2.46 ms** |
-| **Release** | **Concurrent TCP Produce** | 4 clients, 4 partitions | 16 records | 20,000 | **28,909 msgs/s** | **7.05 MiB/s** | **1.62 ms** | **3.66 ms** | **7.72 ms** |
+### Storage Engine Baseline: Local In-Process Append
 
-*(Throughput figures represent median rates across 5 consecutive pooled runs; latency represents pooled sample percentiles).*
+To isolate underlying storage-engine throughput and batch latency from networking and socket scheduling overheads:
+
+```powershell
+.\build-release\Release\eventstream_benchmark.exe .\bench-representative `
+  --messages 10000 --payload-bytes 256 --batch-size 16
+```
+
+- **Configuration**: 256-byte payload, batch size 16, 1 client, 1 partition, persistence mode `appended`, 5 runs × 10,000 messages.
+- **Measurement Method**: Measures direct in-process `BrokerService::produce` batch execution (record serialization, segment log append, and stream flush; excludes TCP serialization, network transfer, and server event loop).
+- **Baseline Results**:
+  - **Median Throughput**: **22,220 msgs/s** (5.42 MiB/s)
+  - **Latency Percentiles**: **p50 = 0.71 ms**, **p95 = 1.29 ms**, **p99 = 1.84 ms**
+
+> [!NOTE]
+> **Measurement Boundaries**: Local append and TCP produce evaluate different subsystem boundaries (in-process API batch append vs. multi-client loopback TCP network round-trip) and are not directly comparable experiments.
+>
+> **Environment & Hardware**: Benchmarks executed on Windows (MSVC 19.44, Release). Per project policy, unavailable host hardware information (CPU model, memory capacity, storage bus/media) is recorded honestly as `not measured` rather than assumed.
+
+### Key Takeaways from the Full Benchmark Matrix
+
+- **Shared vs. Independent Partition Contention**: Under the identical 4-client / 16-record batch workload, writing to 4 independent partitions achieves **48,007 msgs/s** (p50: 1.08 ms) compared to **17,442 msgs/s** (p50: 3.29 ms) on a single shared partition where requests serialize on the per-partition mutex.
+- **Client Scaling**: Increasing concurrency to 16 clients across 4 independent partitions scales throughput to **73,518 msgs/s** (p50: 2.94 ms).
+- **Comprehensive Matrix**: See [docs/benchmarking.md](docs/benchmarking.md) for complete results across 1–16 clients, 1 vs 4 partitions, single-record vs 16-record batches, and internal lock profiling (`--profile on`).
 
 ## Scope and limits
 

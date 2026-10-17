@@ -26,9 +26,9 @@ StreamForge is an append-only, partitioned commit log and message broker impleme
              ▼                            ▼                             ▼
 ┌────────────────────────┐   ┌───────────────────────────┐   ┌───────────────────────────┐
 │ TopicCatalog           │   │ OffsetStore               │   │ GroupCoordinator          │
-│ - Durable metadata     │   │ - Committed consumer      │   │ - In-memory group         │
-│ - Atomic temp-file     │   │   offsets per group       │   │   rebalance & partition   │
-│   replacement          │   │ - Atomic fsync durability │   │   assignment              │
+│ - Durable metadata     │   │ - Committed consumer      │   │ - Experimental prototype  │
+│ - Atomic fsync temp    │   │   offsets per group       │   │ - In-memory partition     │
+│   replacement & dirsync│   │ - Atomic fsync durability │   │   rebalance (unexposed)   │
 └────────────────────────┘   └───────────────────────────┘   └───────────────────────────┘
                                           │
                                           ▼
@@ -40,9 +40,10 @@ StreamForge is an append-only, partitioned commit log and message broker impleme
 │                                                                                        │
 │  - Active Segment: Append-only write stream with contiguous physical offset tracking   │
 │  - Segment Rolling: Bounded segment size rolling (`maximum_segment_bytes`)             │
-│  - Index Seeking: Binary search (`std::lower_bound`) on `.index` for physical position lookup │
+│  - Index Seeking: Binary search (`std::lower_bound`) on `.index` with bounded seek-read │
 │  - Retention: Size-based cleanup (`retention_bytes`) prunes oldest sealed segments     │
 │  - Tail Repair: Auto-truncates incomplete torn frames on crash restart                 │
+│  - Authoritative Log: Rebuilds companion `.index` automatically upon corruption        │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -72,9 +73,12 @@ To prevent deadlocks while maximizing concurrent throughput across independent t
   - Each record contains a CRC-32C checksum, timestamp, key, and payload.
   - Appends are written sequentially to the active segment file and immediately indexed in the `.index` file.
   - Returns contiguous 64-bit offsets.
-- **Index Lookups**:
+- **Index Lookups & Bounded Reads**:
   - The companion `.index` file holds compact 16-byte index entries (`[offset, position]`).
-  - During `fetch`, the broker uses binary search (`std::lower_bound`) to seek directly to the nearest file position, preventing full table scans.
+  - During `fetch`, the broker uses binary search (`std::lower_bound`) to determine physical starting and ending byte positions, seeking directly to the target record range and reading only the required bounded byte slice without loading the entire `.log` file into memory.
+  - The `.log` file is strictly authoritative: any missing, truncated, or corrupted `.index` file is detected during recovery (verifying offset and position monotonicity, entry alignment, and header correspondence) and automatically rebuilt from the log.
+- **Metadata Durability**:
+  - `TopicCatalog` and `OffsetStore` persist metadata using atomic temporary-file replacement with explicit hardware synchronization: write -> flush -> `fsync` temporary file -> atomic rename -> `fsync` parent directory on POSIX (`FlushFileBuffers` on Windows).
 - **Delivery Guarantee**:
   - **At-least-once**: A record is considered committed once written to the process stream. If a client fails between processing and committing its offset, uncommitted records will be safely re-read.
 - **Crash Recovery & Self-Healing**:

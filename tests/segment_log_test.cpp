@@ -89,7 +89,6 @@ TEST_F(SegmentLogTest, RejectsChecksumCorruptionAfterValidRecords) {
   EXPECT_EQ(std::filesystem::file_size(log.path()), size);
 }
 
-#ifdef __unix__
 TEST_F(SegmentLogTest, SyncedAppendIsReadableAfterRestart) {
   SegmentLog log(directory_, 0);
   log.recover();
@@ -99,7 +98,6 @@ TEST_F(SegmentLogTest, SyncedAppendIsReadableAfterRestart) {
   restarted.recover();
   EXPECT_EQ(restarted.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x55}}));
 }
-#endif
 
 TEST_F(SegmentLogTest, CreatesAndPersistsIndexFilesAcrossRollAndRestart) {
   // Use small maximum_segment_bytes to trigger segment rolling
@@ -160,13 +158,17 @@ TEST_F(SegmentLogTest, EnforcesRetentionPolicyByDeletingOldestSegments) {
   EXPECT_NO_THROW(retained_log.fetch(retained_log.base_offset(), 1));
 }
 
-TEST_F(SegmentLogTest, RebuildsIndexAutomaticallyIfDeletedOrCorrupted) {
+TEST_F(SegmentLogTest, RebuildsIndexAutomaticallyIfDeleted) {
   SegmentLog log(directory_, 0);
   log.recover();
-  log.append({Record{.value = {std::byte{0x10}}}, Record{.value = {std::byte{0x20}}}},
-             AcknowledgementMode::kAppended);
+  const auto res = log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}}},
+      AcknowledgementMode::kAppended);
+  (void)res;
 
-  // Corrupt or remove the companion index file
+  // Remove the companion index file
   for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
     if (entry.path().extension() == ".index") {
       std::filesystem::remove(entry.path());
@@ -176,18 +178,357 @@ TEST_F(SegmentLogTest, RebuildsIndexAutomaticallyIfDeletedOrCorrupted) {
   // Next recovery must detect missing index and rebuild it cleanly
   SegmentLog recovered(directory_, 0);
   recovered.recover();
-  EXPECT_EQ(recovered.next_offset(), 2U);
+  EXPECT_EQ(recovered.next_offset(), 3U);
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
   EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
 
   // Confirm .index file was recreated and contains valid entries
   bool index_recreated = false;
   for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
     if (entry.path().extension() == ".index") {
       index_recreated = true;
-      EXPECT_GT(std::filesystem::file_size(entry.path()), 0U);
+      EXPECT_EQ(std::filesystem::file_size(entry.path()), 3U * sizeof(SegmentLog::IndexEntry));
     }
   }
   EXPECT_TRUE(index_recreated);
+}
+
+TEST_F(SegmentLogTest, RebuildsIndexWhenIntermediatePositionAltered) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  const auto res = log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}},
+       Record{.value = {std::byte{0x40}}}},
+      AcknowledgementMode::kAppended);
+  (void)res;
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+  ASSERT_EQ(std::filesystem::file_size(index_path), 4U * sizeof(SegmentLog::IndexEntry));
+
+  // Alter intermediate index entry 1's position to point to an invalid byte within the record payload
+  {
+    std::fstream file(index_path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(file.is_open());
+    // Entry 1 starts at byte 16 (entry 0 is bytes 0..15).
+    // Entry 1 position is stored at bytes 24..31 (offset at 16..23).
+    file.seekg(24);
+    std::uint64_t pos = 0;
+    file.read(reinterpret_cast<char*>(&pos), sizeof(pos));
+    pos += 5;  // Shift position into the middle of the record payload
+    file.seekp(24);
+    file.write(reinterpret_cast<const char*>(&pos), sizeof(pos));
+    file.flush();
+  }
+
+  // Recovery must detect invalid position / boundary mismatch, rebuild from log, and restore correctness
+  SegmentLog recovered(directory_, 0);
+  recovered.recover();
+  EXPECT_EQ(recovered.next_offset(), 4U);
+
+  // Verify that every valid offset returns the correct record after recovery
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+  EXPECT_EQ(recovered.fetch(3, 1).front().value, (std::vector<std::byte>{std::byte{0x40}}));
+
+  // Verify index file was rewritten with valid entries
+  EXPECT_EQ(std::filesystem::file_size(index_path), 4U * sizeof(SegmentLog::IndexEntry));
+}
+
+TEST_F(SegmentLogTest, RebuildsIndexWhenOffsetCorrupted) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  const auto res = log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}},
+       Record{.value = {std::byte{0x40}}}},
+      AcknowledgementMode::kAppended);
+  (void)res;
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+
+  // Corrupt intermediate index entry 2's offset (bytes 32..39) to a non-contiguous offset
+  {
+    std::fstream file(index_path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(file.is_open());
+    file.seekp(32);
+    const std::uint64_t bogus_offset = 999;
+    file.write(reinterpret_cast<const char*>(&bogus_offset), sizeof(bogus_offset));
+    file.flush();
+  }
+
+  // Recovery must detect corrupted offset, rebuild the index, and restore full functionality
+  SegmentLog recovered(directory_, 0);
+  recovered.recover();
+  EXPECT_EQ(recovered.next_offset(), 4U);
+
+  // Verify that every valid offset returns the correct record after recovery
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+  EXPECT_EQ(recovered.fetch(3, 1).front().value, (std::vector<std::byte>{std::byte{0x40}}));
+
+  // Verify index file on disk has been corrected
+  {
+    std::ifstream file(index_path, std::ios::binary);
+    file.seekg(32);
+    std::uint64_t offset = 0;
+    file.read(reinterpret_cast<char*>(&offset), sizeof(offset));
+    EXPECT_EQ(offset, 2U);
+  }
+}
+
+TEST_F(SegmentLogTest, RebuildsIndexWhenFileTruncated) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  const auto res = log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}},
+       Record{.value = {std::byte{0x40}}}},
+      AcknowledgementMode::kAppended);
+  (void)res;
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+  ASSERT_EQ(std::filesystem::file_size(index_path), 64U);
+
+  // Case 1: Truncate index file to 32 bytes (only 2 complete entries out of 4)
+  std::filesystem::resize_file(index_path, 32);
+
+  SegmentLog recovered1(directory_, 0);
+  recovered1.recover();
+  EXPECT_EQ(recovered1.next_offset(), 4U);
+  EXPECT_EQ(recovered1.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered1.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered1.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+  EXPECT_EQ(recovered1.fetch(3, 1).front().value, (std::vector<std::byte>{std::byte{0x40}}));
+  EXPECT_EQ(std::filesystem::file_size(index_path), 64U);
+
+  // Case 2: Truncate index file to 24 bytes (1 complete entry + 8 trailing bytes of torn entry)
+  std::filesystem::resize_file(index_path, 24);
+
+  SegmentLog recovered2(directory_, 0);
+  recovered2.recover();
+  EXPECT_EQ(recovered2.next_offset(), 4U);
+  EXPECT_EQ(recovered2.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered2.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered2.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+  EXPECT_EQ(recovered2.fetch(3, 1).front().value, (std::vector<std::byte>{std::byte{0x40}}));
+  EXPECT_EQ(std::filesystem::file_size(index_path), 64U);
+}
+
+TEST_F(SegmentLogTest, CorruptedIndexEntryIsDetected) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}}},
+      AcknowledgementMode::kAppended);
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+
+  // Corrupt intermediate index entry with random bytes
+  {
+    std::fstream file(index_path, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekp(16);
+    const char garbage[16] = {char(0xDE), char(0xAD), char(0xBE), char(0xEF)};
+    file.write(garbage, sizeof(garbage));
+    file.flush();
+  }
+
+  // Corrupted index entry detected -> rebuilt from authoritative log
+  SegmentLog recovered(directory_, 0);
+  recovered.recover();
+  EXPECT_EQ(recovered.next_offset(), 3U);
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+}
+
+TEST_F(SegmentLogTest, TruncatedIndexFileIsDetected) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}}},
+      AcknowledgementMode::kAppended);
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+
+  // Truncate to unaligned byte boundary (20 bytes instead of 48)
+  std::filesystem::resize_file(index_path, 20);
+
+  SegmentLog recovered(directory_, 0);
+  recovered.recover();
+  EXPECT_EQ(recovered.next_offset(), 3U);
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+  EXPECT_EQ(std::filesystem::file_size(index_path), 3U * sizeof(SegmentLog::IndexEntry));
+}
+
+TEST_F(SegmentLogTest, IndexWithWrongPositionIsDetected) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}}},
+      AcknowledgementMode::kAppended);
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+
+  // Set position to point past the end of the segment log file
+  {
+    std::fstream file(index_path, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekp(sizeof(std::uint64_t)); // position of entry 0
+    const std::uint64_t invalid_pos = 999999;
+    file.write(reinterpret_cast<const char*>(&invalid_pos), sizeof(invalid_pos));
+    file.flush();
+  }
+
+  SegmentLog recovered(directory_, 0);
+  recovered.recover();
+  EXPECT_EQ(recovered.next_offset(), 3U);
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+}
+
+TEST_F(SegmentLogTest, IndexWithWrongOffsetIsDetected) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}}},
+      AcknowledgementMode::kAppended);
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+
+  // Set entry 0 offset to 42 instead of base_offset 0
+  {
+    std::fstream file(index_path, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekp(0);
+    const std::uint64_t wrong_offset = 42;
+    file.write(reinterpret_cast<const char*>(&wrong_offset), sizeof(wrong_offset));
+    file.flush();
+  }
+
+  SegmentLog recovered(directory_, 0);
+  recovered.recover();
+  EXPECT_EQ(recovered.next_offset(), 3U);
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+}
+
+TEST_F(SegmentLogTest, IndexEntriesMustBeMonotonic) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  log.append(
+      {Record{.value = {std::byte{0x10}}},
+       Record{.value = {std::byte{0x20}}},
+       Record{.value = {std::byte{0x30}}}},
+      AcknowledgementMode::kAppended);
+
+  std::filesystem::path index_path;
+  for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+    if (entry.path().extension() == ".index") {
+      index_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(index_path.empty());
+
+  // Make entry 2 position non-monotonic (0 <= entry 1 position)
+  {
+    std::fstream file(index_path, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekp(40);
+    const std::uint64_t non_monotonic_pos = 0;
+    file.write(reinterpret_cast<const char*>(&non_monotonic_pos), sizeof(non_monotonic_pos));
+    file.flush();
+  }
+
+  SegmentLog recovered(directory_, 0);
+  recovered.recover();
+  EXPECT_EQ(recovered.next_offset(), 3U);
+  EXPECT_EQ(recovered.fetch(0, 1).front().value, (std::vector<std::byte>{std::byte{0x10}}));
+  EXPECT_EQ(recovered.fetch(1, 1).front().value, (std::vector<std::byte>{std::byte{0x20}}));
+  EXPECT_EQ(recovered.fetch(2, 1).front().value, (std::vector<std::byte>{std::byte{0x30}}));
+}
+
+TEST_F(SegmentLogTest, BoundedSeekReadFetchesOnlyRequestedSlice) {
+  SegmentLog log(directory_, 0);
+  log.recover();
+  for (std::uint8_t i = 0; i < 10; ++i) {
+    log.append({Record{.value = {std::byte{i}}}}, AcknowledgementMode::kAppended);
+  }
+
+  // Fetch middle slice [4..6] (3 records)
+  const auto slice = log.fetch(4, 3);
+  ASSERT_EQ(slice.size(), 3U);
+  EXPECT_EQ(slice[0].offset, 4U);
+  EXPECT_EQ(slice[0].value.front(), std::byte{4});
+  EXPECT_EQ(slice[1].offset, 5U);
+  EXPECT_EQ(slice[1].value.front(), std::byte{5});
+  EXPECT_EQ(slice[2].offset, 6U);
+  EXPECT_EQ(slice[2].value.front(), std::byte{6});
 }
 
 // Regression: after retention prunes the oldest segments and advances

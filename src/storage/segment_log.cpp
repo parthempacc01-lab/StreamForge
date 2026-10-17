@@ -1,4 +1,5 @@
 #include "streamforge/storage/segment_log.hpp"
+#include "streamforge/storage/durability.hpp"
 
 #include <fstream>
 #include <chrono>
@@ -7,11 +8,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
-
-#ifdef __unix__
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 namespace streamforge::storage {
 namespace {
@@ -57,6 +53,25 @@ std::vector<std::byte> read_bytes(const std::filesystem::path& path) {
   return bytes;
 }
 
+std::vector<std::byte> read_segment_slice(const std::filesystem::path& path,
+                                         std::uint64_t seek_position,
+                                         std::size_t bytes_to_read) {
+  if (bytes_to_read == 0) return {};
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open segment for reading: " + path.string());
+  }
+  input.seekg(static_cast<std::streamoff>(seek_position));
+  if (!input) {
+    throw std::runtime_error("cannot seek in segment: " + path.string());
+  }
+  std::vector<std::byte> bytes(bytes_to_read);
+  if (!input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes_to_read))) {
+    throw std::runtime_error("cannot read bounded slice from segment: " + path.string());
+  }
+  return bytes;
+}
+
 void write_index_file(const std::filesystem::path& path,
                       const std::vector<SegmentLog::IndexEntry>& entries) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -65,6 +80,7 @@ void write_index_file(const std::filesystem::path& path,
     out.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
     out.write(reinterpret_cast<const char*>(&entry.position), sizeof(entry.position));
   }
+  out.flush();
 }
 
 std::vector<SegmentLog::IndexEntry> read_index_file(const std::filesystem::path& path) {
@@ -77,6 +93,22 @@ std::vector<SegmentLog::IndexEntry> read_index_file(const std::filesystem::path&
     entries.push_back(entry);
   }
   return entries;
+}
+
+std::uint32_t read_u32_be(const std::vector<std::byte>& input, std::size_t offset) {
+  std::uint32_t value = 0;
+  for (std::size_t index = 0; index < 4; ++index) {
+    value = (value << 8U) | static_cast<std::uint32_t>(input[offset + index]);
+  }
+  return value;
+}
+
+std::uint64_t read_u64_be(const std::vector<std::byte>& input, std::size_t offset) {
+  std::uint64_t value = 0;
+  for (std::size_t index = 0; index < 8; ++index) {
+    value = (value << 8U) | static_cast<std::uint64_t>(input[offset + index]);
+  }
+  return value;
 }
 
 }  // namespace
@@ -98,29 +130,92 @@ SegmentLog::SegmentLog(std::filesystem::path directory, std::uint64_t base_offse
 void SegmentLog::build_or_load_index(Segment& segment) {
   segment.index = read_index_file(segment.index_path);
 
-  // Validate index entries against actual segment bytes
-  bool index_valid = !segment.index.empty();
-  if (index_valid) {
-    if (segment.index.front().offset != segment.base_offset ||
-        segment.index.back().position >= segment.bytes) {
-      index_valid = false;
+  const auto bytes = read_bytes(segment.path);
+  const std::size_t expected_records = static_cast<std::size_t>(segment.next_offset - segment.base_offset);
+
+  std::error_code ec;
+  const auto index_file_size = std::filesystem::file_size(segment.index_path, ec);
+
+  bool index_valid = false;
+  if (segment.bytes == 0) {
+    index_valid = segment.index.empty() && (ec || index_file_size == 0);
+  } else if (!ec && segment.index.size() == expected_records &&
+             index_file_size == segment.index.size() * sizeof(IndexEntry)) {
+    index_valid = true;
+    for (std::size_t i = 0; i < segment.index.size(); ++i) {
+      const auto& entry = segment.index[i];
+      // 1. Offsets must be strictly sequential and contiguous
+      if (entry.offset != segment.base_offset + i) {
+        index_valid = false;
+        break;
+      }
+      // 2. Position bounds and ordering
+      if (i == 0) {
+        if (entry.position != 0) {
+          index_valid = false;
+          break;
+        }
+      } else {
+        if (entry.position <= segment.index[i - 1].position) {
+          index_valid = false;
+          break;
+        }
+      }
+      if (entry.position + kRecordLengthSize + kMinimumRecordBodySize > segment.bytes) {
+        index_valid = false;
+        break;
+      }
+      // 3. Correspondence to actual record header at entry.position
+      const auto body_size = static_cast<std::size_t>(read_u32_be(bytes, entry.position));
+      if (body_size < kMinimumRecordBodySize || body_size > options_.maximum_record_body_size) {
+        index_valid = false;
+        break;
+      }
+      const auto record_total_size = kRecordLengthSize + body_size;
+      if (entry.position + record_total_size > segment.bytes) {
+        index_valid = false;
+        break;
+      }
+      const auto header_pos = entry.position + kRecordLengthSize;
+      if (static_cast<std::uint8_t>(bytes[header_pos]) != kRecordVersion) {
+        index_valid = false;
+        break;
+      }
+      const auto rec_offset = read_u64_be(bytes, header_pos + 2);
+      if (rec_offset != entry.offset) {
+        index_valid = false;
+        break;
+      }
+      // 4. Record boundary continuity
+      if (i + 1 < segment.index.size()) {
+        if (segment.index[i + 1].position != entry.position + record_total_size) {
+          index_valid = false;
+          break;
+        }
+      } else {
+        if (entry.position + record_total_size != segment.bytes) {
+          index_valid = false;
+          break;
+        }
+      }
     }
   }
 
   if (index_valid) return;
 
-  // Build index by scanning the segment
+  // Build index by scanning the verified segment bytes
   segment.index.clear();
-  const auto bytes = read_bytes(segment.path);
-  const auto scan = scan_records(bytes, segment.base_offset, options_.maximum_record_body_size);
-  if (scan.disposition == ScanDisposition::kComplete) {
-    std::uint64_t curr_pos = 0;
-    for (const auto& rec : scan.records) {
-      segment.index.push_back(IndexEntry{rec.offset, curr_pos});
-      curr_pos += encode_record(rec, options_.maximum_record_body_size).size();
+  std::size_t cursor = 0;
+  while (cursor + kRecordLengthSize + kMinimumRecordBodySize <= segment.bytes) {
+    const auto body_size = static_cast<std::size_t>(read_u32_be(bytes, cursor));
+    if (body_size < kMinimumRecordBodySize || cursor + kRecordLengthSize + body_size > segment.bytes) {
+      break;
     }
-    write_index_file(segment.index_path, segment.index);
+    const auto offset = read_u64_be(bytes, cursor + kRecordLengthSize + 2);
+    segment.index.push_back(IndexEntry{offset, cursor});
+    cursor += kRecordLengthSize + body_size;
   }
+  write_index_file(segment.index_path, segment.index);
 }
 
 void SegmentLog::recover() {
@@ -332,25 +427,18 @@ void SegmentLog::set_fault_injection_after_records(std::size_t count) noexcept {
 }
 
 void SegmentLog::synchronize() const {
-#ifdef __unix__
-  const int descriptor = ::open(segments_.back().path.c_str(), O_RDONLY);
-  if (descriptor < 0) {
-    throw std::runtime_error("cannot open segment for synchronization: " + segments_.back().path.string());
-  }
-  const int result = ::fsync(descriptor);
-  const int close_result = ::close(descriptor);
-  if (result != 0 || close_result != 0) {
-    throw std::runtime_error("segment synchronization failed: " + segments_.back().path.string());
-  }
-#else
-  throw std::runtime_error("SYNCED acknowledgement is supported only on POSIX targets");
-#endif
+  sync_file(segments_.back().path);
 }
 
 std::vector<Record> SegmentLog::scan_or_throw(const Segment& segment, std::uint64_t start_offset,
                                               std::size_t maximum_records) const {
+  if (segment.bytes == 0 || maximum_records == 0) {
+    return {};
+  }
+
   std::uint64_t seek_position = 0;
   std::uint64_t scan_base_offset = segment.base_offset;
+  std::uint64_t end_position = segment.bytes;
 
   if (!segment.index.empty() && start_offset > segment.base_offset) {
     auto it = std::lower_bound(segment.index.begin(), segment.index.end(), start_offset,
@@ -366,19 +454,37 @@ std::vector<Record> SegmentLog::scan_or_throw(const Segment& segment, std::uint6
     }
   }
 
-  const auto bytes = read_bytes(segment.path);
-  if (seek_position > bytes.size()) {
+  if (!segment.index.empty()) {
+    const std::uint64_t target_end_offset = start_offset + maximum_records;
+    auto end_it = std::lower_bound(segment.index.begin(), segment.index.end(), target_end_offset,
+                                   [](const IndexEntry& entry, std::uint64_t val) {
+                                     return entry.offset < val;
+                                   });
+    if (end_it != segment.index.end()) {
+      end_position = end_it->position;
+    }
+  }
+
+  if (seek_position > end_position || end_position > segment.bytes) {
     throw std::runtime_error("invalid index seek position in segment");
   }
 
-  std::span<const std::byte> slice(bytes.data() + seek_position, bytes.size() - seek_position);
+  const std::size_t bytes_to_read = static_cast<std::size_t>(end_position - seek_position);
+  if (bytes_to_read == 0) {
+    return {};
+  }
+
+  const auto bytes = read_segment_slice(segment.path, seek_position, bytes_to_read);
+  std::span<const std::byte> slice(bytes.data(), bytes.size());
   const auto scan = scan_records(slice, scan_base_offset, options_.maximum_record_body_size);
   if (scan.disposition != ScanDisposition::kComplete) {
     throw std::runtime_error("segment is not a complete valid log");
   }
   std::vector<Record> records;
   for (auto& record : scan.records) {
-    if (record.offset >= start_offset && records.size() < maximum_records) records.push_back(std::move(record));
+    if (record.offset >= start_offset && records.size() < maximum_records) {
+      records.push_back(std::move(record));
+    }
   }
   return records;
 }

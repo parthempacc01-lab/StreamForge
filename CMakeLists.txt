@@ -20,6 +20,7 @@ endif()
 add_library(streamforge_core
   src/protocol/frame_codec.cpp
   src/network/tcp_server.cpp
+  src/storage/durability.cpp
   src/storage/record_codec.cpp
   src/storage/segment_log.cpp
   src/broker/topic_catalog.cpp

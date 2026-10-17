@@ -12,7 +12,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: lukka/get-cmake@latest
+      - uses: lukka/get-cmake@v10.1
       - name: Configure
         env:
           CXX: ${{ matrix.compiler }}
@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: lukka/get-cmake@latest
+      - uses: lukka/get-cmake@v10.1
       - name: Configure with Clang sanitizers
         env:
           CXX: clang++
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: lukka/get-cmake@latest
+      - uses: lukka/get-cmake@v10.1
       - name: Configure with Clang ThreadSanitizer
         env:
           CXX: clang++
@@ -58,3 +58,20 @@ jobs:
         env:
           TSAN_OPTIONS: halt_on_error=1
         run: ctest --test-dir build-tsan --output-on-failure
+
+  linux-fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@v10.1
+      - name: Configure Fuzz Targets with Clang
+        env:
+          CXX: clang++
+          CC: clang
+        run: cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=Release -DSTREAMFORGE_BUILD_FUZZERS=ON
+      - name: Build Fuzz Targets
+        run: cmake --build build-fuzz --target streamforge_frame_codec_fuzz streamforge_record_codec_fuzz --parallel
+      - name: Smoke Fuzz FrameDecoder (10 seconds)
+        run: ./build-fuzz/tests/streamforge_frame_codec_fuzz -max_total_time=10
+      - name: Smoke Fuzz RecordCodec (10 seconds)
+        run: ./build-fuzz/tests/streamforge_record_codec_fuzz -max_total_time=10

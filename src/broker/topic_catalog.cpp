@@ -1,4 +1,5 @@
 #include "streamforge/broker/topic_catalog.hpp"
+#include "streamforge/storage/durability.hpp"
 
 #include <cctype>
 #include <fstream>
@@ -79,12 +80,7 @@ void TopicCatalog::persist() const {
     output.flush();
     if (!output) throw std::runtime_error("cannot write complete topic catalog");
   }
-  std::error_code error;
-  std::filesystem::rename(temporary, catalog_path(), error);
-  if (error) {
-    std::filesystem::remove(temporary);
-    throw std::runtime_error("cannot atomically replace topic catalog: " + error.message());
-  }
+  storage::atomic_durable_rename(temporary, catalog_path());
 }
 
 std::filesystem::path TopicCatalog::metadata_directory() const { return data_root_ / "metadata"; }

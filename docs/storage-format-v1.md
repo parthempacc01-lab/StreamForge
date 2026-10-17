@@ -38,3 +38,20 @@ completed records with bad checksums, unsupported
 versions, invalid key/value lengths, and offset gaps are corruption even when
 they occur at the final record. They must fail broker startup rather than be
 silently discarded.
+
+### Index validation and rebuild
+
+Companion `.index` files are strictly validated against the already-verified
+segment records during recovery:
+- Index file length must equal `expected_records * sizeof(IndexEntry)` (16 bytes
+  per entry) with no trailing bytes or truncated partial records.
+- Offsets must be strictly sequential and contiguous (`entry[i].offset == base_offset + i`).
+- File positions must be strictly monotonically increasing and begin at position `0`.
+- Record correspondence: each entry's position must point to a valid record whose
+  version matches `1`, whose header offset matches the entry's offset, and whose
+  total record length lands exactly at the next entry's position (or the end of the
+  segment bytes for the final entry).
+
+If any index entry is missing, corrupted, misordered, misaligned, or truncated,
+`SegmentLog::build_or_load_index()` automatically rebuilds the complete index
+by scanning the verified log bytes and safely rewrites the `.index` file to disk.
